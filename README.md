@@ -134,4 +134,4 @@ dbus-run-session -- gnome-shell --nested --wayland
 
 ## License
 
-LGPL-3.0-or-later. See [LICENSE](LICENSE).
+GPL-3.0-or-later. See [LICENSE](LICENSE).

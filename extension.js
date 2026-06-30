@@ -50,6 +50,10 @@ const TwingateIndicator = GObject.registerClass(
             // so disable() can force_exit anything still in flight.
             this._procs = new Set();
 
+            // Cancels in-flight subprocess reads in stop() so their async
+            // callbacks can't fire against this object after it's destroyed.
+            this._cancellable = new Gio.Cancellable();
+
             // Handles for command items living inside the service/notifier submenus.
             this._subItemHandles = [];
 
@@ -200,6 +204,10 @@ const TwingateIndicator = GObject.registerClass(
         }
 
         // A submenu of one-shot command items. entries: {label, command, armPoll}.
+        // `command` goes through GLib.spawn_command_line_async (shell-parsed), so
+        // it MUST be a static literal — never interpolate CLI/user-derived data
+        // here. Anything taking a dynamic name goes through _spawnArgv (argv, no
+        // shell) instead.
         _buildCommandSubMenu(title, entries) {
             const sub = new PopupMenu.PopupSubMenuMenuItem(title);
             for (const e of entries) {
@@ -237,7 +245,8 @@ const TwingateIndicator = GObject.registerClass(
                 return;
             }
             this._procs.add(proc);
-            proc.communicate_utf8_async(null, null, (p, res) => {
+            proc.communicate_utf8_async(null, this._cancellable, (p, res) => {
+                if (this._cancellable?.is_cancelled()) return;
                 this._procs.delete(proc);
                 let out = '';
                 try {
@@ -448,7 +457,9 @@ const TwingateIndicator = GObject.registerClass(
             const lines = stdout.split('\n').map(l => l.trimEnd()).filter(l => l.length > 0);
             for (let i = 0; i < lines.length; i++) {
                 const line = lines[i];
-                if (i === 0 && line.includes('RESOURCE NAME')) continue;
+                // Drop the column header wherever it lands (tolerates a leading
+                // banner/blank line before it).
+                if (line.includes('RESOURCE NAME')) continue;
                 const cols = line.split('\t').map(c => c.trim());
                 if (!cols[0]) continue;
                 rows.push({
@@ -492,7 +503,8 @@ const TwingateIndicator = GObject.registerClass(
             }
 
             this._resourcesProc = proc;
-            proc.communicate_utf8_async(null, null, (p, res) => {
+            proc.communicate_utf8_async(null, this._cancellable, (p, res) => {
+                if (this._cancellable?.is_cancelled()) return;
                 this._resourcesProc = null;
                 this._resourcesLoading = false;
                 let stdout = '';
@@ -806,6 +818,10 @@ const TwingateIndicator = GObject.registerClass(
             // Stop the poll source first so it can never fire against actors we
             // are about to destroy below.
             this._removeFileWatch();
+
+            // Cancel in-flight subprocess reads so their queued async callbacks
+            // bail out instead of touching this object after destroy().
+            this._cancellable?.cancel();
 
             if (this._toggleItem && this._toggleHandle) {
                 this._toggleItem.disconnect(this._toggleHandle);
