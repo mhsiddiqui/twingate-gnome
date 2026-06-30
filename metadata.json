@@ -1,0 +1,10 @@
+{
+  "name": "Twingate Gnome",
+  "description": "Shows a status icon on the Gnome top bar indicating Twingate's connection status. Lets you connect/disconnect, browse authorized resources, and re-authenticate any of them. Requires the Twingate CLI.",
+  "uuid": "twingate-gnome@mhsiddiqui.github.io",
+  "shell-version": [
+    "46"
+  ],
+  "url": "https://github.com/mhsiddiqui/twingate-gnome",
+  "version-name": "1.0.0"
+}

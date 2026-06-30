@@ -1,0 +1,131 @@
+/* Add your custom extension styling here */
+.twingate_gnome_local_on {
+    background-image: url("icons/twingate_on.png");
+    background-size: 20px;
+    height: 20px;
+    width: 20px;
+}
+
+.twingate_gnome_local_off {
+    background-image: url("icons/twingate_off.png");
+    background-size: 20px;
+    height: 20px;
+    width: 20px;
+}
+
+/* Resources modal dialog */
+.twingate_gnome_local_dialog .modal-dialog-content-box {
+    min-width: 720px;
+}
+
+.twingate_gnome_local_titlebar {
+    margin-bottom: 10px;
+}
+
+.twingate_gnome_local_title {
+    font-weight: bold;
+    font-size: 1.2em;
+}
+
+.twingate_gnome_local_close {
+    padding: 4px;
+    border-radius: 6px;
+}
+
+.twingate_gnome_local_close:hover,
+.twingate_gnome_local_close:focus {
+    background-color: rgba(255, 255, 255, 0.15);
+}
+
+.twingate_gnome_local_search {
+    margin-bottom: 10px;
+}
+
+/* Height is set dynamically in JS (_dialogScrollHeight) so the dialog fits the
+   screen and its action buttons stay visible; only the min-width lives here. */
+.twingate_gnome_local_scroll {
+    min-width: 720px;
+}
+
+/* --- Resources table --- */
+.twingate_gnome_local_thead {
+    spacing: 1px;
+    border-bottom: 2px solid rgba(255, 255, 255, 0.35);
+    margin-bottom: 2px;
+}
+
+.twingate_gnome_local_hcell {
+    padding: 8px;
+    font-weight: bold;
+    color: #ffffff;
+}
+
+.twingate_gnome_local_trow {
+    spacing: 1px;
+    border-bottom: 1px solid rgba(255, 255, 255, 0.12);
+}
+
+.twingate_gnome_local_trow_alt {
+    background-color: rgba(255, 255, 255, 0.04);
+}
+
+.twingate_gnome_local_cell {
+    spacing: 4px;
+    padding: 6px 8px;
+}
+
+/* Column widths — header and data cells share these so columns line up.
+   The Address column has no fixed width and x-expands to fill the rest. */
+.twingate_gnome_local_c_name {
+    width: 170px;
+}
+
+.twingate_gnome_local_c_alias {
+    width: 150px;
+}
+
+.twingate_gnome_local_c_auth {
+    width: 120px;
+}
+
+.twingate_gnome_local_namebtn {
+    border-radius: 6px;
+    font-weight: bold;
+}
+
+.twingate_gnome_local_namebtn:hover,
+.twingate_gnome_local_namebtn:focus {
+    color: #8ab4f8;
+    background-color: rgba(255, 255, 255, 0.1);
+}
+
+/* --- Simple list rows (exit node / account dialogs) --- */
+.twingate_gnome_local_rowbtn {
+    padding: 8px;
+    border-radius: 6px;
+}
+
+.twingate_gnome_local_rowbtn:hover,
+.twingate_gnome_local_rowbtn:focus {
+    background-color: rgba(255, 255, 255, 0.1);
+}
+
+.twingate_gnome_local_name {
+    font-weight: bold;
+}
+
+/* --- Shared --- */
+.twingate_gnome_local_copy {
+    padding: 4px;
+    border-radius: 6px;
+}
+
+.twingate_gnome_local_copy:hover,
+.twingate_gnome_local_copy:focus {
+    background-color: rgba(255, 255, 255, 0.15);
+}
+
+.twingate_gnome_local_empty {
+    padding: 12px;
+    color: #bbbbbb;
+}
