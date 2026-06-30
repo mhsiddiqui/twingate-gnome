@@ -46,7 +46,7 @@ const TwingateIndicator = GObject.registerClass(
             this._resourcesError = false;
             this._resourcesProc = null;
 
-            // Short-lived subprocesses (exit-node/account/version/report) tracked
+            // Short-lived subprocesses (exit-node/account/version) tracked
             // so disable() can force_exit anything still in flight.
             this._procs = new Set();
 
@@ -125,10 +125,6 @@ const TwingateIndicator = GObject.registerClass(
             this._versionItem = new PopupMenu.PopupMenuItem('twingate', { reactive: false });
             this.menu.addMenuItem(this._versionItem);
 
-            this._reportItem = new PopupMenu.PopupMenuItem('Collect diagnostics');
-            this._reportHandle = this._reportItem.connect('activate', () => this._handleReport());
-            this.menu.addMenuItem(this._reportItem);
-
             // Prefetch the resource list when the menu opens so the dialog is instant.
             this._menuOpenHandle = this.menu.connect('open-state-changed', (_menu, open) => {
                 if (open && this._connected && !this._resourcesLoaded && !this._resourcesLoading)
@@ -189,18 +185,6 @@ const TwingateIndicator = GObject.registerClass(
                 GLib.spawn_command_line_async('twingate disconnect');
             else
                 GLib.spawn_command_line_async('twingate connect');
-        }
-
-        _handleReport() {
-            Main.notify('Twingate', 'Collecting diagnostics…');
-            this._runForLines(['twingate', 'report'], (out) => {
-                if (out === null) {
-                    Main.notify('Twingate', 'Failed to collect diagnostics');
-                    return;
-                }
-                const first = out.split('\n').map(l => l.trim()).filter(l => l.length > 0)[0];
-                Main.notify('Twingate diagnostics', first ?? 'Diagnostics collected');
-            });
         }
 
         // A submenu of one-shot command items. entries: {label, command, armPoll}.
@@ -306,8 +290,8 @@ const TwingateIndicator = GObject.registerClass(
             this._openCommandDialog({
                 title: 'Exit node',
                 topActions: [
-                    { label: 'Route all traffic through Twingate', argv: ['twingate', 'exit-node', 'start'] },
-                    { label: 'Stop routing all traffic', argv: ['twingate', 'exit-node', 'stop'] },
+                    { label: 'Start routing all traffic through Twingate', argv: ['twingate', 'exit-node', 'start'] },
+                    { label: 'Stop routing all traffic through Twingate', argv: ['twingate', 'exit-node', 'stop'] },
                 ],
                 listArgv: ['twingate', 'exit-node', 'list'],
                 listHeader: 'Exit node',
@@ -843,10 +827,6 @@ const TwingateIndicator = GObject.registerClass(
                 this._accountItem.disconnect(this._accountHandle);
                 this._accountHandle = null;
             }
-            if (this._reportItem && this._reportHandle) {
-                this._reportItem.disconnect(this._reportHandle);
-                this._reportHandle = null;
-            }
             if (this.menu && this._menuOpenHandle) {
                 this.menu.disconnect(this._menuOpenHandle);
                 this._menuOpenHandle = null;
@@ -898,8 +878,6 @@ const TwingateIndicator = GObject.registerClass(
             this._userItem = null;
             this._versionItem?.destroy();
             this._versionItem = null;
-            this._reportItem?.destroy();
-            this._reportItem = null;
         }
     }
 );
