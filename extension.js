@@ -108,8 +108,8 @@ const TwingateIndicator = GObject.registerClass(
 
             // Daemon + notifier controls, grouped into submenus.
             this._serviceMenu = this._buildCommandSubMenu('Service', [
-                { label: 'Start', command: 'twingate service-start', armPoll: true },
-                { label: 'Stop', command: 'twingate service-stop', armPoll: true },
+                { label: 'Start', command: 'twingate service-start', privileged: true },
+                { label: 'Stop', command: 'twingate service-stop', privileged: true },
             ]);
             this._notifMenu = this._buildCommandSubMenu('Notifications', [
                 { label: 'Start', command: 'twingate desktop-start', armPoll: false },
@@ -168,35 +168,75 @@ const TwingateIndicator = GObject.registerClass(
             });
         }
 
+        // Bring the Twingate daemon up/down. The daemon (twingate.service) is
+        // root-owned: `twingate start`/`stop` shell out to `sudo twingate
+        // service-start`/`service-stop` internally, and that sudo aborts when
+        // spawned without a controlling terminal ("sudo: a terminal is required to
+        // read the password") — which is why the old fire-and-forget spawns did
+        // nothing and tripped apport ("Ubuntu has encountered an issue"). So we run
+        // the privileged step through pkexec, which pops the desktop's polkit
+        // admin-password dialog, and only fire the user-level follow-ups (which
+        // need no sudo once the daemon is already in the target state) on success.
         _handleToggle() {
-            this._armFastPoll();
-            if (this._connected) {
-                GLib.spawn_command_line_async('twingate stop');
-                GLib.spawn_command_line_async('twingate desktop-stop');
-            } else {
-                GLib.spawn_command_line_async('twingate start');
-                GLib.spawn_command_line_async('twingate desktop-start');
-            }
+            if (this._connected)
+                this._spawnPrivileged(['twingate', 'service-stop'], [['twingate', 'desktop-stop']]);
+            else
+                this._spawnPrivileged(['twingate', 'service-start'], [['twingate', 'start']]);
         }
 
         _handlePause() {
-            this._armFastPoll();
             if (this._connected)
-                GLib.spawn_command_line_async('twingate disconnect');
+                this._spawnPrivileged(['twingate', 'service-stop']);
             else
-                GLib.spawn_command_line_async('twingate connect');
+                this._spawnPrivileged(['twingate', 'service-start'], [['twingate', 'connect']]);
         }
 
-        // A submenu of one-shot command items. entries: {label, command, armPoll}.
-        // `command` goes through GLib.spawn_command_line_async (shell-parsed), so
-        // it MUST be a static literal — never interpolate CLI/user-derived data
-        // here. Anything taking a dynamic name goes through _spawnArgv (argv, no
-        // shell) instead.
+        // Run a root-requiring twingate subcommand via pkexec (which shows the
+        // desktop's admin-password dialog) and, only if the user authenticates and
+        // the command succeeds, arm the fast poll and fire the user-level follow-up
+        // argv commands. Cancelling the password dialog or a failed auth leaves the
+        // current state untouched. The proc is tracked in this._procs so stop() can
+        // force_exit it, and the callback bails if the shared cancellable fired.
+        _spawnPrivileged(privilegedArgv, followUps = []) {
+            let proc;
+            try {
+                proc = Gio.Subprocess.new(['pkexec', ...privilegedArgv], Gio.SubprocessFlags.NONE);
+            } catch {
+                // pkexec missing / spawn failure — surfaces in Twingate's own UI.
+                return;
+            }
+            this._procs.add(proc);
+            proc.wait_async(this._cancellable, (p, res) => {
+                if (this._cancellable?.is_cancelled()) return;
+                this._procs.delete(proc);
+                try {
+                    p.wait_finish(res);
+                } catch {
+                    return;
+                }
+                if (!p.get_successful()) return;
+                this._armFastPoll();
+                for (const argv of followUps) this._spawnArgv(argv);
+            });
+        }
+
+        // A submenu of one-shot command items. entries: {label, command, armPoll,
+        // privileged}. `command` goes through GLib.spawn_command_line_async
+        // (shell-parsed), so it MUST be a static literal — never interpolate
+        // CLI/user-derived data here. Anything taking a dynamic name goes through
+        // _spawnArgv (argv, no shell) instead. `privileged` entries (root-owned
+        // daemon control) are routed through pkexec via _spawnPrivileged so the
+        // admin-password dialog appears instead of a headless sudo crash; its
+        // static `command` is split into argv (safe — no user data).
         _buildCommandSubMenu(title, entries) {
             const sub = new PopupMenu.PopupSubMenuMenuItem(title);
             for (const e of entries) {
                 const item = new PopupMenu.PopupMenuItem(e.label);
                 const handle = item.connect('activate', () => {
+                    if (e.privileged) {
+                        this._spawnPrivileged(e.command.split(' '));
+                        return;
+                    }
                     if (e.armPoll) this._armFastPoll();
                     GLib.spawn_command_line_async(e.command);
                 });
