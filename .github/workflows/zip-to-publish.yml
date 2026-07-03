@@ -18,7 +18,7 @@ jobs:
 
       - name: Create zip
         run: |
-          zip -r twingate-gnome@mhsiddiqui.github.io.zip icons/ extension.js metadata.json stylesheet.css LICENSE
+          zip -r twingate-gnome@mhsiddiqui.github.io.zip extension.js subprocess.js metadata.json stylesheet.css LICENSE
 
       - name: Upload package
         uses: svenstaro/upload-release-action@v2

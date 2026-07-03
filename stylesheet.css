@@ -1,17 +1,5 @@
-/* Add your custom extension styling here */
-.twingate_gnome_local_on {
-    background-image: url("icons/twingate_on.png");
-    background-size: 20px;
-    height: 20px;
-    width: 20px;
-}
-
-.twingate_gnome_local_off {
-    background-image: url("icons/twingate_off.png");
-    background-size: 20px;
-    height: 20px;
-    width: 20px;
-}
+/* The panel icon uses stock symbolic icons (network-vpn-symbolic /
+   network-vpn-disabled-symbolic) via St.Icon, so no icon styling lives here. */
 
 /* Resources modal dialog */
 .twingate_gnome_local_dialog .modal-dialog-content-box {

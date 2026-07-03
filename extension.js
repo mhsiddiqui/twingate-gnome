@@ -1,7 +1,6 @@
 import GObject from 'gi://GObject';
 import St from 'gi://St';
 import GLib from 'gi://GLib';
-import Gio from 'gi://Gio';
 import Clutter from 'gi://Clutter';
 import Pango from 'gi://Pango';
 
@@ -11,6 +10,8 @@ import * as PanelMenu from 'resource:///org/gnome/shell/ui/panelMenu.js';
 import * as PopupMenu from 'resource:///org/gnome/shell/ui/popupMenu.js';
 import * as ModalDialog from 'resource:///org/gnome/shell/ui/modalDialog.js';
 
+import { TwingateCli } from './subprocess.js';
+
 
 export default class TwingateGnomeExtension extends Extension {
     enable() {
@@ -19,17 +20,15 @@ export default class TwingateGnomeExtension extends Extension {
     }
 
     disable() {
-        if (this._indicator) {
-            this._indicator.stop();
-            this._indicator.destroy();
-            this._indicator = null;
-        }
+        this._indicator?.destroy();
+        this._indicator = null;
     }
 }
 
 const SOCKET_PATH = '/run/twingate/auth.sock';
-const ICON_ON = 'twingate_gnome_local_on';
-const ICON_OFF = 'twingate_gnome_local_off';
+// Stock Adwaita symbolic icons — no bundled raster icons to ship.
+const ICON_ON = 'network-vpn-symbolic';
+const ICON_OFF = 'network-vpn-disabled-symbolic';
 const FAST_POLL_MS = 1000;
 const SLOW_POLL_MS = 10000;
 
@@ -39,23 +38,14 @@ const TwingateIndicator = GObject.registerClass(
         constructor() {
             super(0.0, 'Twingate Status');
 
+            // All subprocess spawning goes through this; destroy() tears it down.
+            this._cli = new TwingateCli();
+
             this._connected = false;
             this._resources = [];
             this._resourcesLoaded = false;
             this._resourcesLoading = false;
             this._resourcesError = false;
-            this._resourcesProc = null;
-
-            // Short-lived subprocesses (exit-node/account/version) tracked
-            // so disable() can force_exit anything still in flight.
-            this._procs = new Set();
-
-            // Cancels in-flight subprocess reads in stop() so their async
-            // callbacks can't fire against this object after it's destroyed.
-            this._cancellable = new Gio.Cancellable();
-
-            // Handles for command items living inside the service/notifier submenus.
-            this._subItemHandles = [];
 
             // Modal dialog widgets (created lazily in _openResourcesDialog).
             this._dialog = null;
@@ -70,7 +60,7 @@ const TwingateIndicator = GObject.registerClass(
             this._copyResetTimeout = null;
             this._copiedIcon = null;
 
-            this.icon = new St.Icon({ style_class: ICON_OFF });
+            this.icon = new St.Icon({ icon_name: ICON_OFF, style_class: 'system-status-icon' });
             this.add_child(this.icon);
 
             this._statusItem = new PopupMenu.PopupMenuItem('Status: offline', { reactive: false });
@@ -78,43 +68,43 @@ const TwingateIndicator = GObject.registerClass(
 
             // Full connect/disconnect (start/stop).
             this._toggleItem = new PopupMenu.PopupMenuItem('Connect');
-            this._toggleHandle = this._toggleItem.connect('activate', () => this._handleToggle());
+            this._toggleItem.connectObject('activate', () => this._handleToggle(), this);
             this.menu.addMenuItem(this._toggleItem);
 
             // Pause (disconnect) / Reconnect (connect) — keeps tokens.
             this._pauseItem = new PopupMenu.PopupMenuItem('Pause (keep tokens)');
-            this._pauseHandle = this._pauseItem.connect('activate', () => this._handlePause());
+            this._pauseItem.connectObject('activate', () => this._handlePause(), this);
             this.menu.addMenuItem(this._pauseItem);
 
             this.menu.addMenuItem(new PopupMenu.PopupSeparatorMenuItem());
 
             this._resourcesItem = new PopupMenu.PopupMenuItem('Resources…');
-            this._resourcesHandle = this._resourcesItem.connect('activate', () => this._openResourcesDialog());
+            this._resourcesItem.connectObject('activate', () => this._openResourcesDialog(), this);
             this._resourcesItem.setSensitive(false);
             this.menu.addMenuItem(this._resourcesItem);
 
             // Exit node routing — opens a modal (submenus don't render reliably).
             this._exitNodeItem = new PopupMenu.PopupMenuItem('Exit node…');
-            this._exitNodeHandle = this._exitNodeItem.connect('activate', () => this._openExitNodeDialog());
+            this._exitNodeItem.connectObject('activate', () => this._openExitNodeDialog(), this);
             this._exitNodeItem.setSensitive(false);
             this.menu.addMenuItem(this._exitNodeItem);
 
             // Account — opens a modal.
             this._accountItem = new PopupMenu.PopupMenuItem('Account…');
-            this._accountHandle = this._accountItem.connect('activate', () => this._openAccountDialog());
+            this._accountItem.connectObject('activate', () => this._openAccountDialog(), this);
             this.menu.addMenuItem(this._accountItem);
 
             this.menu.addMenuItem(new PopupMenu.PopupSeparatorMenuItem());
 
             // Daemon + notifier controls, grouped into submenus.
             this._serviceMenu = this._buildCommandSubMenu('Service', [
-                { label: 'Start', command: 'twingate service-start', privileged: true },
-                { label: 'Stop', command: 'twingate service-stop', privileged: true },
+                { label: 'Start', argv: ['twingate', 'service-start'], privileged: true },
+                { label: 'Stop', argv: ['twingate', 'service-stop'], privileged: true },
             ]);
             this._notifMenu = this._buildCommandSubMenu('Notifications', [
-                { label: 'Start', command: 'twingate desktop-start', armPoll: false },
-                { label: 'Stop', command: 'twingate desktop-stop', armPoll: false },
-                { label: 'Restart', command: 'twingate desktop-restart', armPoll: false },
+                { label: 'Start', argv: ['twingate', 'desktop-start'] },
+                { label: 'Stop', argv: ['twingate', 'desktop-stop'] },
+                { label: 'Restart', argv: ['twingate', 'desktop-restart'] },
             ]);
 
             this.menu.addMenuItem(new PopupMenu.PopupSeparatorMenuItem());
@@ -126,10 +116,10 @@ const TwingateIndicator = GObject.registerClass(
             this.menu.addMenuItem(this._versionItem);
 
             // Prefetch the resource list when the menu opens so the dialog is instant.
-            this._menuOpenHandle = this.menu.connect('open-state-changed', (_menu, open) => {
+            this.menu.connectObject('open-state-changed', (_menu, open) => {
                 if (open && this._connected && !this._resourcesLoaded && !this._resourcesLoading)
                     this._loadResources(false);
-            });
+            }, this);
 
             this._loadVersion();
             this._loadUser();
@@ -138,14 +128,14 @@ const TwingateIndicator = GObject.registerClass(
 
         _setUiState() {
             if (this._connected) {
-                this.icon.style_class = ICON_ON;
+                this.icon.icon_name = ICON_ON;
                 this._statusItem.label.text = 'Status: online';
                 this._toggleItem.label.text = 'Disconnect';
                 this._pauseItem.label.text = 'Pause (keep tokens)';
                 this._resourcesItem.setSensitive(true);
                 this._exitNodeItem.setSensitive(true);
             } else {
-                this.icon.style_class = ICON_OFF;
+                this.icon.icon_name = ICON_OFF;
                 this._statusItem.label.text = 'Status: offline';
                 this._toggleItem.label.text = 'Connect';
                 this._pauseItem.label.text = 'Reconnect';
@@ -161,127 +151,62 @@ const TwingateIndicator = GObject.registerClass(
         }
 
         _armFastPoll() {
-            this._removeFileWatch();
-            this._addFileWatch(FAST_POLL_MS, () => {
-                this._removeFileWatch();
-                this._addFileWatch(SLOW_POLL_MS);
-            });
+            // Poll quickly until the next state transition, then relax to slow.
+            this._addFileWatch(FAST_POLL_MS, () => this._addFileWatch(SLOW_POLL_MS));
         }
 
         // Bring the Twingate daemon up/down. The daemon (twingate.service) is
         // root-owned: `twingate start`/`stop` shell out to `sudo twingate
         // service-start`/`service-stop` internally, and that sudo aborts when
         // spawned without a controlling terminal ("sudo: a terminal is required to
-        // read the password") — which is why the old fire-and-forget spawns did
-        // nothing and tripped apport ("Ubuntu has encountered an issue"). So we run
-        // the privileged step through pkexec, which pops the desktop's polkit
-        // admin-password dialog, and only fire the user-level follow-ups (which
-        // need no sudo once the daemon is already in the target state) on success.
+        // read the password"). So we run the privileged step through pkexec, which
+        // pops the desktop's polkit admin-password dialog, and only fire the
+        // user-level follow-ups (which need no sudo once the daemon is already in
+        // the target state) on success.
         _handleToggle() {
             if (this._connected)
-                this._spawnPrivileged(['twingate', 'service-stop'], [['twingate', 'desktop-stop']]);
+                this._daemon(['twingate', 'service-stop'], ['twingate', 'desktop-stop']);
             else
-                this._spawnPrivileged(['twingate', 'service-start'], [['twingate', 'start']]);
+                this._daemon(['twingate', 'service-start'], ['twingate', 'start']);
         }
 
         _handlePause() {
             if (this._connected)
-                this._spawnPrivileged(['twingate', 'service-stop']);
+                this._daemon(['twingate', 'service-stop']);
             else
-                this._spawnPrivileged(['twingate', 'service-start'], [['twingate', 'connect']]);
+                this._daemon(['twingate', 'service-start'], ['twingate', 'connect']);
         }
 
-        // Run a root-requiring twingate subcommand via pkexec (which shows the
-        // desktop's admin-password dialog) and, only if the user authenticates and
-        // the command succeeds, arm the fast poll and fire the user-level follow-up
-        // argv commands. Cancelling the password dialog or a failed auth leaves the
-        // current state untouched. The proc is tracked in this._procs so stop() can
-        // force_exit it, and the callback bails if the shared cancellable fired.
-        _spawnPrivileged(privilegedArgv, followUps = []) {
-            let proc;
-            try {
-                proc = Gio.Subprocess.new(['pkexec', ...privilegedArgv], Gio.SubprocessFlags.NONE);
-            } catch {
-                // pkexec missing / spawn failure — surfaces in Twingate's own UI.
+        // Run the root-requiring daemon step via pkexec, then — only if the user
+        // authenticated and it succeeded — arm the fast poll and fire the
+        // user-level follow-up. Bails if the extension was disabled meanwhile.
+        async _daemon(privilegedArgv, followUpArgv) {
+            const ok = await this._cli.runPrivileged(privilegedArgv);
+            if (!ok || this._cli.cancelled)
                 return;
-            }
-            this._procs.add(proc);
-            proc.wait_async(this._cancellable, (p, res) => {
-                if (this._cancellable?.is_cancelled()) return;
-                this._procs.delete(proc);
-                try {
-                    p.wait_finish(res);
-                } catch {
-                    return;
-                }
-                if (!p.get_successful()) return;
-                this._armFastPoll();
-                for (const argv of followUps) this._spawnArgv(argv);
-            });
+            this._armFastPoll();
+            if (followUpArgv)
+                this._cli.spawn(followUpArgv);
         }
 
-        // A submenu of one-shot command items. entries: {label, command, armPoll,
-        // privileged}. `command` goes through GLib.spawn_command_line_async
-        // (shell-parsed), so it MUST be a static literal — never interpolate
-        // CLI/user-derived data here. Anything taking a dynamic name goes through
-        // _spawnArgv (argv, no shell) instead. `privileged` entries (root-owned
-        // daemon control) are routed through pkexec via _spawnPrivileged so the
-        // admin-password dialog appears instead of a headless sudo crash; its
-        // static `command` is split into argv (safe — no user data).
+        // A submenu of one-shot command items. entries: {label, argv, privileged}.
+        // `privileged` entries (root-owned daemon control) go through pkexec via
+        // _daemon so the admin-password dialog appears instead of a headless sudo
+        // crash; everything else is a plain user-level spawn.
         _buildCommandSubMenu(title, entries) {
             const sub = new PopupMenu.PopupSubMenuMenuItem(title);
             for (const e of entries) {
                 const item = new PopupMenu.PopupMenuItem(e.label);
-                const handle = item.connect('activate', () => {
-                    if (e.privileged) {
-                        this._spawnPrivileged(e.command.split(' '));
-                        return;
-                    }
-                    if (e.armPoll) this._armFastPoll();
-                    GLib.spawn_command_line_async(e.command);
-                });
-                this._subItemHandles.push({ item, handle });
+                item.connectObject('activate', () => {
+                    if (e.privileged)
+                        this._daemon(e.argv);
+                    else
+                        this._cli.spawn(e.argv);
+                }, this);
                 sub.menu.addMenuItem(item);
             }
             this.menu.addMenuItem(sub);
             return sub;
-        }
-
-        // Fire-and-forget a command given as an argv array (no shell quoting).
-        _spawnArgv(argv) {
-            try {
-                Gio.Subprocess.new(argv, Gio.SubprocessFlags.NONE);
-            } catch {
-                // failures surface in Twingate's own UI
-            }
-        }
-
-        // Run a command and hand its stdout (or null on failure) to cb.
-        _runForLines(argv, cb) {
-            let proc;
-            try {
-                proc = Gio.Subprocess.new(
-                    argv,
-                    Gio.SubprocessFlags.STDOUT_PIPE | Gio.SubprocessFlags.STDERR_PIPE,
-                );
-            } catch {
-                cb(null);
-                return;
-            }
-            this._procs.add(proc);
-            proc.communicate_utf8_async(null, this._cancellable, (p, res) => {
-                if (this._cancellable?.is_cancelled()) return;
-                this._procs.delete(proc);
-                let out = '';
-                try {
-                    const [, o] = p.communicate_utf8_finish(res);
-                    out = o ?? '';
-                } catch {
-                    cb(null);
-                    return;
-                }
-                cb(p.get_successful() ? out : null);
-            });
         }
 
         // Best-effort line parser for `list`-style CLI output. Drops blank lines,
@@ -296,12 +221,13 @@ const TwingateIndicator = GObject.registerClass(
                 .filter(l => l.length > 0);
         }
 
-        _loadVersion() {
-            this._runForLines(['twingate', 'version'], (out) => {
-                if (!this._versionItem || !out) return;
-                const first = out.split('\n').map(l => l.trim()).filter(l => l.length > 0)[0];
-                if (first) this._versionItem.label.text = first;
-            });
+        async _loadVersion() {
+            const out = await this._cli.run(['twingate', 'version']);
+            if (this._cli.cancelled || !this._versionItem || !out)
+                return;
+            const first = out.split('\n').map(l => l.trim()).filter(l => l.length > 0)[0];
+            if (first)
+                this._versionItem.label.text = first;
         }
 
         // `twingate account list` is a table: EMAIL <tab> NETWORK <tab> NETWORK URL.
@@ -317,16 +243,17 @@ const TwingateIndicator = GObject.registerClass(
                 .filter(l => l.length > 0 && !l.toLowerCase().startsWith('no account'));
         }
 
-        _loadUser() {
-            this._runForLines(['twingate', 'account', 'list'], (out) => {
-                if (!this._userItem || !out) return;
-                const emails = this._parseAccountEmails(out);
-                this._userItem.label.text = emails.length ? `User: ${emails[0]}` : 'User: (none)';
-            });
+        async _loadUser() {
+            const out = await this._cli.run(['twingate', 'account', 'list']);
+            if (this._cli.cancelled || !this._userItem || !out)
+                return;
+            const emails = this._parseAccountEmails(out);
+            this._userItem.label.text = emails.length ? `User: ${emails[0]}` : 'User: (none)';
         }
 
         _openExitNodeDialog() {
-            if (!this._connected) return;
+            if (!this._connected)
+                return;
             this._openCommandDialog({
                 title: 'Exit node',
                 topActions: [
@@ -337,7 +264,7 @@ const TwingateIndicator = GObject.registerClass(
                 listHeader: 'Exit node',
                 skip: ['no exit nodes'],
                 emptyText: '(no exit nodes available)',
-                onPick: (name) => this._spawnArgv(['twingate', 'exit-node', 'switch', name]),
+                onPick: (name) => this._cli.spawn(['twingate', 'exit-node', 'switch', name]),
             });
         }
 
@@ -348,7 +275,7 @@ const TwingateIndicator = GObject.registerClass(
                 listHeader: 'Account',
                 parse: (out) => this._parseAccountEmails(out),
                 emptyText: '(no accounts)',
-                onPick: (id) => this._spawnArgv(['twingate', 'account', 'switch', id]),
+                onPick: (id) => this._cli.spawn(['twingate', 'account', 'switch', id]),
                 extraButtons: [{ label: 'Logout', argv: ['twingate', 'account', 'logout'] }],
             });
         }
@@ -398,7 +325,8 @@ const TwingateIndicator = GObject.registerClass(
             };
             // Distinct header row for the loaded list (matches Resources table).
             const addListHeader = () => {
-                if (!listHeader) return;
+                if (!listHeader)
+                    return;
                 const header = new St.BoxLayout({ style_class: 'twingate_gnome_local_thead', x_expand: true });
                 header.add_child(new St.Label({ text: listHeader, style_class: 'twingate_gnome_local_hcell', x_expand: true }));
                 listBox.add_child(header);
@@ -436,7 +364,7 @@ const TwingateIndicator = GObject.registerClass(
 
             const renderTop = () => {
                 for (const a of topActions)
-                    addActionRow(a.label, () => { this._spawnArgv(a.argv); dialog.close(); });
+                    addActionRow(a.label, () => { this._cli.spawn(a.argv); dialog.close(); });
                 if (topActions.length)
                     listBox.add_child(new St.Label({ text: '', style_class: 'twingate_gnome_local_empty' }));
             };
@@ -445,8 +373,9 @@ const TwingateIndicator = GObject.registerClass(
             addListHeader();
             addMessage('Loading…');
 
-            this._runForLines(listArgv, (out) => {
-                if (this._cmdDialog !== dialog) return;
+            this._cli.run(listArgv).then((out) => {
+                if (this._cmdDialog !== dialog)
+                    return;
                 listBox.remove_all_children();
                 renderTop();
                 addListHeader();
@@ -465,13 +394,14 @@ const TwingateIndicator = GObject.registerClass(
 
             const buttons = extraButtons.map(b => ({
                 label: b.label,
-                action: () => { this._spawnArgv(b.argv); dialog.close(); },
+                action: () => { this._cli.spawn(b.argv); dialog.close(); },
             }));
             buttons.push({ label: 'Close', action: () => dialog.close(), key: Clutter.KEY_Escape });
             dialog.setButtons(buttons);
 
             dialog.connect('destroy', () => {
-                if (this._cmdDialog === dialog) this._cmdDialog = null;
+                if (this._cmdDialog === dialog)
+                    this._cmdDialog = null;
             });
             dialog.open();
         }
@@ -483,9 +413,11 @@ const TwingateIndicator = GObject.registerClass(
                 const line = lines[i];
                 // Drop the column header wherever it lands (tolerates a leading
                 // banner/blank line before it).
-                if (line.includes('RESOURCE NAME')) continue;
+                if (line.includes('RESOURCE NAME'))
+                    continue;
                 const cols = line.split('\t').map(c => c.trim());
-                if (!cols[0]) continue;
+                if (!cols[0])
+                    continue;
                 rows.push({
                     name: cols[0],
                     address: cols[1] ?? '',
@@ -496,15 +428,16 @@ const TwingateIndicator = GObject.registerClass(
             return rows;
         }
 
-        _loadResources(force, onComplete) {
+        async _loadResources(force, onComplete) {
             if (!this._connected) {
                 this._resources = [];
-                if (onComplete) onComplete();
+                onComplete?.();
                 return;
             }
-            if (this._resourcesLoading) return;
+            if (this._resourcesLoading)
+                return;
             if (this._resourcesLoaded && !force) {
-                if (onComplete) onComplete();
+                onComplete?.();
                 return;
             }
 
@@ -512,66 +445,46 @@ const TwingateIndicator = GObject.registerClass(
             this._resourcesError = false;
             this._renderResourceList();
 
-            let proc;
-            try {
-                proc = Gio.Subprocess.new(
-                    ['twingate', '-d', 'resources'],
-                    Gio.SubprocessFlags.STDOUT_PIPE | Gio.SubprocessFlags.STDERR_PIPE,
-                );
-            } catch {
-                this._resourcesLoading = false;
-                this._resourcesError = true;
-                this._renderResourceList();
-                if (onComplete) onComplete();
+            const stdout = await this._cli.run(['twingate', '-d', 'resources']);
+            if (this._cli.cancelled)
                 return;
-            }
-
-            this._resourcesProc = proc;
-            proc.communicate_utf8_async(null, this._cancellable, (p, res) => {
-                if (this._cancellable?.is_cancelled()) return;
-                this._resourcesProc = null;
-                this._resourcesLoading = false;
-                let stdout = '';
-                try {
-                    const [, out] = p.communicate_utf8_finish(res);
-                    stdout = out ?? '';
-                } catch {
-                    this._resourcesError = true;
-                    this._renderResourceList();
-                    if (onComplete) onComplete();
-                    return;
-                }
-                if (!p.get_successful()) {
-                    this._resourcesError = true;
-                    this._renderResourceList();
-                    if (onComplete) onComplete();
-                    return;
-                }
+            this._resourcesLoading = false;
+            if (stdout === null) {
+                this._resourcesError = true;
+            } else {
                 this._resources = this._parseResources(stdout);
                 this._resourcesLoaded = true;
-                this._renderResourceList();
-                if (onComplete) onComplete();
-            });
+            }
+            this._renderResourceList();
+            onComplete?.();
         }
 
         _activateResource(name) {
-            this._spawnArgv(['twingate', 'auth', name]);
+            this._cli.spawn(['twingate', 'auth', name]);
             this._dialog?.close();
         }
 
-        _resetCopyIcon() {
+        // Cancel a pending "copied" revert timer and forget the tracked icon
+        // without touching it — used when the dialog (and its icon) is torn down.
+        _cancelCopyReset() {
             if (this._copyResetTimeout) {
                 GLib.Source.remove(this._copyResetTimeout);
                 this._copyResetTimeout = null;
             }
-            if (this._copiedIcon) {
-                try { this._copiedIcon.icon_name = 'edit-copy-symbolic'; } catch { /* destroyed */ }
-                this._copiedIcon = null;
-            }
+            this._copiedIcon = null;
+        }
+
+        // Revert the copy button glyph from the checkmark back to the copy icon
+        // while the dialog is still alive, then clear the timer.
+        _resetCopyIcon() {
+            if (this._copiedIcon)
+                this._copiedIcon.icon_name = 'edit-copy-symbolic';
+            this._cancelCopyReset();
         }
 
         _copyText(text, icon) {
-            if (!text) return;
+            if (!text)
+                return;
             St.Clipboard.get_default().set_text(St.ClipboardType.CLIPBOARD, text);
 
             this._resetCopyIcon();
@@ -594,7 +507,8 @@ const TwingateIndicator = GObject.registerClass(
         }
 
         _renderResourceList() {
-            if (!this._listBox) return;
+            if (!this._listBox)
+                return;
             this._resetCopyIcon();
             this._listBox.remove_all_children();
             this._firstMatchName = null;
@@ -610,7 +524,8 @@ const TwingateIndicator = GObject.registerClass(
 
             const filter = (this._searchEntry?.get_text() ?? '').trim().toLowerCase();
             const matches = this._resources.filter(r => {
-                if (!filter) return true;
+                if (!filter)
+                    return true;
                 return r.name.toLowerCase().includes(filter)
                     || r.address.toLowerCase().includes(filter)
                     || r.alias.toLowerCase().includes(filter);
@@ -661,12 +576,11 @@ const TwingateIndicator = GObject.registerClass(
         }
 
         _headerCell(text, columnClass, expand) {
-            const label = new St.Label({
+            return new St.Label({
                 text,
                 style_class: `twingate_gnome_local_hcell ${columnClass}`,
                 x_expand: !!expand,
             });
-            return label;
         }
 
         // A table cell holding a value, optionally with a copy-to-clipboard button.
@@ -744,7 +658,8 @@ const TwingateIndicator = GObject.registerClass(
         }
 
         _openResourcesDialog() {
-            if (!this._connected) return;
+            if (!this._connected)
+                return;
             // One dialog at a time.
             if (this._dialog) {
                 this._dialog.open();
@@ -768,7 +683,8 @@ const TwingateIndicator = GObject.registerClass(
             this._searchEntry = entry;
             entry.clutter_text.connect('text-changed', () => this._renderResourceList());
             entry.clutter_text.connect('activate', () => {
-                if (this._firstMatchName) this._activateResource(this._firstMatchName);
+                if (this._firstMatchName)
+                    this._activateResource(this._firstMatchName);
             });
             dialog.contentLayout.add_child(entry);
 
@@ -797,7 +713,7 @@ const TwingateIndicator = GObject.registerClass(
 
             // destroyOnClose tears down the actor; drop our references with it.
             dialog.connect('destroy', () => {
-                this._resetCopyIcon();
+                this._cancelCopyReset();
                 this._dialog = null;
                 this._searchEntry = null;
                 this._listBox = null;
@@ -813,19 +729,14 @@ const TwingateIndicator = GObject.registerClass(
         }
 
         _addFileWatch(pollInterval, onChange) {
+            // Never stack sources — drop any existing poll before arming a new one.
+            this._removeFileWatch();
             this._pollerTimeoutHandle = GLib.timeout_add(GLib.PRIORITY_DEFAULT, pollInterval, () => {
-                if (GLib.file_test(SOCKET_PATH, GLib.FileTest.EXISTS)) {
-                    if (!this._connected) {
-                        this._connected = true;
-                        this._setUiState();
-                        if (onChange) onChange();
-                    }
-                } else {
-                    if (this._connected) {
-                        this._connected = false;
-                        this._setUiState();
-                        if (onChange) onChange();
-                    }
+                const connected = GLib.file_test(SOCKET_PATH, GLib.FileTest.EXISTS);
+                if (connected !== this._connected) {
+                    this._connected = connected;
+                    this._setUiState();
+                    onChange?.();
                 }
                 return GLib.SOURCE_CONTINUE;
             });
@@ -838,86 +749,21 @@ const TwingateIndicator = GObject.registerClass(
             }
         }
 
-        stop() {
-            // Stop the poll source first so it can never fire against actors we
-            // are about to destroy below.
+        // Overrides PanelMenu.Button.destroy(); called from the extension's
+        // disable(). Releases every non-actor resource (poll source, in-flight
+        // subprocesses, copy timer, open dialogs), then chains up so GObject tears
+        // down the actor tree and auto-disconnects all connectObject() handlers.
+        destroy() {
             this._removeFileWatch();
+            this._cli.destroy();
+            this._cancelCopyReset();
 
-            // Cancel in-flight subprocess reads so their queued async callbacks
-            // bail out instead of touching this object after destroy().
-            this._cancellable?.cancel();
+            this._dialog?.destroy();
+            this._dialog = null;
+            this._cmdDialog?.destroy();
+            this._cmdDialog = null;
 
-            if (this._toggleItem && this._toggleHandle) {
-                this._toggleItem.disconnect(this._toggleHandle);
-                this._toggleHandle = null;
-            }
-            if (this._pauseItem && this._pauseHandle) {
-                this._pauseItem.disconnect(this._pauseHandle);
-                this._pauseHandle = null;
-            }
-            if (this._resourcesItem && this._resourcesHandle) {
-                this._resourcesItem.disconnect(this._resourcesHandle);
-                this._resourcesHandle = null;
-            }
-            if (this._exitNodeItem && this._exitNodeHandle) {
-                this._exitNodeItem.disconnect(this._exitNodeHandle);
-                this._exitNodeHandle = null;
-            }
-            if (this._accountItem && this._accountHandle) {
-                this._accountItem.disconnect(this._accountHandle);
-                this._accountHandle = null;
-            }
-            if (this.menu && this._menuOpenHandle) {
-                this.menu.disconnect(this._menuOpenHandle);
-                this._menuOpenHandle = null;
-            }
-
-            if (this._resourcesProc) {
-                try { this._resourcesProc.force_exit(); } catch { /* noop */ }
-                this._resourcesProc = null;
-            }
-            for (const proc of this._procs) {
-                try { proc.force_exit(); } catch { /* noop */ }
-            }
-            this._procs.clear();
-
-            for (const { item, handle } of this._subItemHandles) {
-                try { item.disconnect(handle); } catch { /* noop */ }
-            }
-            this._subItemHandles = [];
-
-            this._resetCopyIcon();
-            if (this._dialog) {
-                this._dialog.destroy();
-                this._dialog = null;
-            }
-            if (this._cmdDialog) {
-                this._cmdDialog.destroy();
-                this._cmdDialog = null;
-            }
-
-            this.icon?.destroy();
-            this.icon = null;
-            this._statusItem?.destroy();
-            this._statusItem = null;
-            this._toggleItem?.destroy();
-            this._toggleItem = null;
-            this._pauseItem?.destroy();
-            this._pauseItem = null;
-            this._resourcesItem?.destroy();
-            this._resourcesItem = null;
-            this._exitNodeItem?.destroy();
-            this._exitNodeItem = null;
-            this._accountItem?.destroy();
-            this._accountItem = null;
-            this._serviceMenu?.destroy();
-            this._serviceMenu = null;
-            this._notifMenu?.destroy();
-            this._notifMenu = null;
-            this._userItem?.destroy();
-            this._userItem = null;
-            this._versionItem?.destroy();
-            this._versionItem = null;
+            super.destroy();
         }
     }
 );
